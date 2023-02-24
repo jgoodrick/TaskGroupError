@@ -1,6 +1,7 @@
 
 import Foundation
 import ComposableArchitecture
+import AsyncAlgorithms
 
 struct MyReducer {
     @Dependency(\.continuousClock) var clock
@@ -12,16 +13,16 @@ extension MyReducer {
     enum CancelID {}
         
     struct State: Equatable {
-        var queue: [Submission]
-        var uploadsInFlight: Bool = false
+        var queue: [Submission] = []
+        var inFlight: InFlightSubmissions?
     }
     
     enum Action: Equatable {
         case task
         case queue(Submission)
-        case triggerUpload
-        case registerProgress
-        case finishedUpload
+        case startSubmitting
+        case received(result: Submission.Result)
+        case finishedSubmitting
         case cancel
     }
 }
@@ -33,7 +34,7 @@ extension MyReducer: ReducerProtocol {
             
             return .run { send in
                 for await _ in clock.timer(interval: .seconds(5.0)) {
-                    await send(.triggerUpload)
+                    await send(.startSubmitting)
                 }
             }.cancellable(id: CancelID.self)
             
@@ -41,41 +42,57 @@ extension MyReducer: ReducerProtocol {
             
             state.queue.append(newSubmission)
                         
-            return .send(.triggerUpload)
+            return .send(.startSubmitting)
             
-        case .triggerUpload where !state.uploadsInFlight && !state.queue.isEmpty:
+        case .startSubmitting where state.inFlight == nil && !state.queue.isEmpty:
             
-            state.uploadsInFlight = true
+            state.inFlight = .init()
             
             return .run { [records = state.queue] send in
-                await withTaskGroup(of: Void.self) { group in
-                    for submission in records {
-                        group.addTask {
-                            let _ = await apiClient.submit(submission)
+                
+                let channel = AsyncChannel<Action>()
+                
+                Task(priority: .background) {
+                    await withTaskGroup(of: Submission.Result.self) { group in
+                        for submission in records {
+                            group.addTask {
+                                await apiClient.submit(submission)
+                            }
                         }
+                                                
+                        for await result in group {
+                            await channel.send(.received(result: result))
+                        }
+                        await channel.send(.finishedSubmitting)
+                        channel.finish()
                     }
-                    
-                    for await _ in group {
-                        await send(.registerProgress)
-                    }
-                    
-                    await send(.finishedUpload)
                 }
+                
+                for await action in channel {
+                    await send(action)
+                }
+                
             }.cancellable(id: CancelID.self)
-
-        case .triggerUpload:
+            
+        case .startSubmitting:
                         
             return .none
             
-        case .registerProgress:
-                        
+        case .received(let result):
+            
+            guard var inFlight = state.inFlight else {
+                return .none
+            }
+            
+            inFlight.results.append(result)
+            
             return .none
             
-        case .finishedUpload:
+        case .finishedSubmitting:
                         
             state.queue = []
                         
-            state.uploadsInFlight = false
+            state.inFlight = nil
             
             return .none
             
@@ -88,20 +105,40 @@ extension MyReducer: ReducerProtocol {
     
 }
 
-struct Submission: Sendable, Equatable {
+struct Submission: Sendable, Equatable, Identifiable {
     let id: UUID
 }
 
+extension Submission {
+    struct Failure: Error, Equatable {}
+    
+    enum Result: Sendable, Equatable {
+        case success(for: Submission.ID)
+        case failure(for: Submission.ID, Failure)
+    }
+}
+
+extension Submission.Result: Identifiable {
+    var id: Submission.ID {
+        switch self {
+        case .success(let id): return id
+        case .failure(let id, _): return id
+        }
+    }
+}
+
+struct InFlightSubmissions: Equatable {
+    var results: [Submission.Result] = []
+}
+
 struct APIClient {
-    var submission: @Sendable (Submission) async -> SubmissionError?
+    var submission: @Sendable (Submission) async -> Submission.Result
 }
 
 extension APIClient {
     
-    struct SubmissionError: Error, Equatable {}
-    
-    func submit(_ data: Submission) async -> SubmissionError? {
-        await submission(data)
+    func submit(_ value: Submission) async -> Submission.Result {
+        await submission(value)
     }
 }
 
@@ -113,7 +150,7 @@ extension DependencyValues {
 }
 
 extension APIClient: DependencyKey {
-    static let liveValue: Self = .init(submission: { _ in nil })
+    static let liveValue: Self = .init(submission: { .success(for: $0.id) })
 }
 
 extension APIClient: TestDependencyKey {
