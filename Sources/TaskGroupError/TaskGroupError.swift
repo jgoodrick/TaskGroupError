@@ -20,8 +20,8 @@ extension MyReducer {
         case task
         case queue(Submission)
         case triggerUpload
-        case registerProgress(completed: Int, of: Int)
-        case finishedUpload(errors: [UUID: APIClient.SubmissionError])
+        case registerProgress
+        case finishedUpload
         case cancel
     }
 }
@@ -48,27 +48,18 @@ extension MyReducer: ReducerProtocol {
             state.uploadsInFlight = true
             
             return .run { [records = state.queue] send in
-                await withTaskGroup(of: (UUID, APIClient.SubmissionError?).self) { group in
+                await withTaskGroup(of: Void.self) { group in
                     for submission in records {
                         group.addTask {
-                            if let error = await apiClient.submit(submission) {
-                                return (submission.id, error)
-                            } else {
-                                return (submission.id, nil)
-                            }
+                            let _ = await apiClient.submit(submission)
                         }
                     }
                     
-                    var errors = [UUID: APIClient.SubmissionError]()
-                    var counter = 0
-                    
-                    for await (id, error) in group {
-                        errors[id] = error
-                        counter += 1
-                        await send(.registerProgress(completed: counter, of: records.count))
+                    for await _ in group {
+                        await send(.registerProgress)
                     }
                     
-                    await send(.finishedUpload(errors: errors))
+                    await send(.finishedUpload)
                 }
             }.cancellable(id: CancelID.self)
 
@@ -76,17 +67,13 @@ extension MyReducer: ReducerProtocol {
                         
             return .none
             
-        case .registerProgress(let completed, let total):
-            
-            print("completed: \(completed) of \(total)")
-            
+        case .registerProgress:
+                        
             return .none
             
-        case .finishedUpload(let errors):
+        case .finishedUpload:
                         
-            let idsWithError = Set(errors.keys)
-            
-            state.queue = state.queue.filter({idsWithError.contains($0.id)})
+            state.queue = []
                         
             state.uploadsInFlight = false
             

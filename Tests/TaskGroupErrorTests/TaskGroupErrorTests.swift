@@ -44,7 +44,7 @@ final class TaskGroupErrorTests: XCTestCase {
         await store.receive(.triggerUpload) {
             $0.uploadsInFlight = true
         }
-        await store.receive(.finishedUpload(errors: [:])) {
+        await store.receive(.finishedUpload) {
             $0.queue = []
             $0.uploadsInFlight = false
         }
